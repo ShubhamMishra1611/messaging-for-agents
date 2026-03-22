@@ -1,79 +1,78 @@
-# WhatsApp for AI Agents
+# Agent Message Bus
 
-Messaging infrastructure for AI agents inspired by WhatsApp's architecture. Agents DM each other, post tasks to groups, and idle agents claim work atomically.
+Distributed messaging infrastructure for autonomous AI agents. Horizontally scalable WebSocket servers, Redis pub/sub for cross-node routing, PostgreSQL-backed exactly-once delivery, and atomic work distribution via `INSERT ON CONFLICT`.
 
 ## Architecture
 
 ```
-[Agent A] --WS--> [FastAPI Server 1] --Redis Pub/Sub--> [FastAPI Server 2] --WS--> [Agent B]
+[Agent A] --WS--> [FastAPI Node 1] --Redis Pub/Sub--> [FastAPI Node 2] --WS--> [Agent B]
                          |                                       |
                     [PostgreSQL] <--- shared DB / ack table ---> [PostgreSQL]
 ```
 
-**Layer 4 LB** in front of FastAPI servers (sticky sessions by agent_id for WS).
+L4 load balancer in front, sticky sessions by `agent_id` for persistent WS connections.
 
 ## Components
 
 ### WebSocket Server (`server/`)
-- FastAPI with `/ws/{agent_id}` endpoint
-- `ConnectionManager` — local WS registry, rejects duplicate agent_ids
-- `MessageRouter` — DM vs group routing, exactly-once via delivery_attempts table
-- `RedisPubSub` — cross-server message bridge
-- Auth via bearer token on HTTP, query param on WS
-- Per-message error handling (bad message doesn't kill connection)
-- Input validation, message size limits, agent_id regex
+- `/ws/{agent_id}` — persistent duplex channel per agent
+- `ConnectionManager` — per-node WS registry, rejects duplicate `agent_id` connections
+- `MessageRouter` — DM vs group fan-out, exactly-once via `delivery_attempts` table
+- `RedisPubSub` — cross-node message bridge using pattern subscriptions (`dm:*`, `group:*`)
+- Bearer token auth on HTTP, query param auth on WS handshake
+- Per-message error isolation (bad payload doesn't tear down the connection)
+- Input validation: `agent_id` regex `^[a-zA-Z0-9_-]{1,128}$`, 1MB message cap, status enum
 
 ### Agent Registry (`registry/`)
-- Postgres (persistent) + Redis cache (fast lookup)
-- Capability-based discovery: "who can do NLP?" → list of idle agents
-- Group membership model with join/leave
-- Status tracking: idle, busy, offline
+- PostgreSQL (persistent) + Redis cache (TTL 300s) for fast lookup
+- Capability-based discovery: query idle agents by skill tags
+- Group membership model — `group_memberships` table with join/leave over WS
+- Agent lifecycle: `idle` → `busy` → `idle` | `offline` on disconnect
 
 ### Persistence & Exactly-Once (`db/`)
-- `messages` — every message stored with UUID, sender, receiver, status, recipient_count
-- `delivery_attempts` — INSERT before sending (not TOCTOU check-then-send)
-- `acks` — receiver dedup, message marked "delivered" only when all recipients ack
-- `claims` — atomic task claiming via `INSERT ON CONFLICT DO NOTHING`
-- `group_memberships` — who belongs to which group
+- `messages` — UUID-keyed, stores `recipient_count` for group delivery tracking
+- `delivery_attempts` — atomic lock before send: `INSERT ON CONFLICT` prevents duplicate delivery across nodes (no TOCTOU race)
+- `acks` — `(message_id, agent_id)` unique, message marked `delivered` only when `count(acks) >= recipient_count`
+- `claims` — atomic work distribution: `INSERT ON CONFLICT DO NOTHING RETURNING id`, winner gets a row back, losers get `NULL`
+- `group_memberships` — scopes group delivery to members only
 
-### Demo Agents (`agents/`)
-- `BaseAgent` — WS client with auto-ack, reconnect loop (not recursive), auth
-- `WorkerAgent` — claims tasks atomically, processes with local LLM (Ollama)
-- `OrchestratorAgent` — decomposes goals via LLM, posts tasks to group
-- `llm.py` — async Ollama wrapper
+### Agent SDK (`agents/`)
+- `BaseAgent` — async WS client, auto-ack, iterative reconnect with exponential backoff, configurable auth
+- `WorkerAgent` — claims tasks atomically, delegates to local LLM (Ollama)
+- `OrchestratorAgent` — decomposes goals via LLM, distributes subtasks to group
+- `llm.py` — thin async httpx wrapper around Ollama `/api/chat`
 
-## Exactly-Once Flow
-
-```
-1. Agent sends message with UUID
-2. Server persists (status=pending)
-3. Server publishes to Redis channel dm:{to} or group:{group_id}
-4. Target server receives, INSERT delivery_attempt (atomic lock)
-5. If INSERT succeeds → deliver. If conflict → skip (another server delivered)
-6. Agent receives, sends ACK
-7. Server inserts ack, marks delivered when ack_count >= recipient_count
-```
-
-## Group Task Claiming
+## Exactly-Once Delivery
 
 ```
-1. Orchestrator posts to group:workers
-2. All group members receive the message
-3. Each tries: INSERT INTO claims (message_id, agent_id) ON CONFLICT DO NOTHING
-4. Check .returning(Claim.id).fetchone() — only one gets a row back
-5. Winner processes task, others skip
+1. Sender transmits message with client-generated UUID
+2. Server persists message (status=pending, recipient_count=N)
+3. Server publishes envelope to Redis channel dm:{agent_id} or group:{group_id}
+4. Receiving node's pubsub handler attempts INSERT INTO delivery_attempts (atomic)
+5. INSERT succeeds → deliver over WS. Conflict → another node already delivered, skip.
+6. Agent sends ACK {message_id}
+7. Server inserts ack row. When count(acks) >= recipient_count → status=delivered
 ```
+
+## Atomic Work Distribution
+
+```
+1. Orchestrator publishes task to group:workers
+2. All group members receive the message via Redis fan-out
+3. Each worker: INSERT INTO claims (message_id, agent_id) ON CONFLICT DO NOTHING RETURNING id
+4. Exactly one gets a non-NULL return → that worker owns the task
+5. Winner sets status=busy, processes, sends result DM, sets status=idle
+```
+
+Note: uses `.returning(Claim.id).fetchone()` instead of `rowcount` — psycopg3 returns `-1` for `rowcount` with `ON CONFLICT DO NOTHING`.
 
 ## Quick Start
 
 ```bash
-# start infra
 docker compose up -d
-
-# install deps
 pip install -r requirements.txt
 
-# run server
+# start server (Windows needs SelectorEventLoop for psycopg async)
 python -c "
 import asyncio, sys
 if sys.platform == 'win32':
@@ -82,52 +81,18 @@ import uvicorn
 uvicorn.run('server.main:app', host='0.0.0.0', port=8000)
 "
 
-# run demo (3 workers + orchestrator, needs Ollama with qwen3 models)
+# run demo (requires Ollama with qwen3:0.6b and qwen3:1.7b)
 python demo.py
 ```
 
-## Tech Stack
-- **FastAPI** + websockets — async WS server
-- **Redis** — pub/sub for cross-server routing, agent status cache
-- **PostgreSQL** + SQLAlchemy async — persistence, exactly-once, claims
-- **psycopg3** — async Postgres driver
-- **Ollama** — local LLM inference for demo agents
-- **asyncio** — fully async, no blocking I/O
+## Design Decisions
 
-## Key Design Decisions
-
-| Decision | Why |
-|----------|-----|
-| Delivery attempts table over TOCTOU ack check | Prevents race between check and send across servers |
-| `.returning().fetchone()` over `rowcount` | psycopg3 returns -1 for rowcount with ON CONFLICT DO NOTHING |
-| Always publish to Redis (even local) | Consistency + auditability across all server instances |
-| Group membership table | Prevents broadcasting to all agents, only group members receive |
-| Per-message try/except in WS handler | One bad message doesn't kill the connection |
-| No FK on claims table | Workers claim by message_id received over WS, FK would require message to exist in local DB first |
-
-## Project Structure
-
-```
-messaging_for_agents/
-├── server/
-│   ├── main.py               # FastAPI app, WS endpoint, auth
-│   ├── connection_manager.py  # local WS registry
-│   ├── message_router.py      # routing + exactly-once delivery
-│   └── redis_pubsub.py        # Redis pub/sub + cache
-├── registry/
-│   └── agent_registry.py      # register, lookup, groups, capabilities
-├── db/
-│   ├── database.py            # SQLAlchemy async engine
-│   ├── models.py              # Message, Agent, Ack, Claim, etc.
-│   └── init.sql               # raw SQL schema
-├── agents/
-│   ├── base_agent.py          # WS client base class
-│   ├── orchestrator_agent.py  # posts tasks via LLM decomposition
-│   ├── worker_agent.py        # claims + processes with LLM
-│   └── llm.py                 # Ollama async wrapper
-├── demo.py                    # end-to-end demo script
-├── test_claim.py              # claim atomicity test
-├── docker-compose.yml         # Postgres + Redis + 2 servers
-├── Dockerfile
-└── requirements.txt
-```
+| Decision | Rationale |
+|----------|-----------|
+| `delivery_attempts` INSERT before send | Eliminates TOCTOU race in exactly-once — check-then-send across nodes is fundamentally broken |
+| `.returning().fetchone()` over `rowcount` | psycopg3 + SQLAlchemy implicit RETURNING makes `rowcount` return -1 on `ON CONFLICT DO NOTHING` |
+| Always publish to Redis, even for local agents | Uniform routing path, no split-brain between local and cross-node delivery |
+| Group membership table | Fan-out scoped to members only — no broadcast storms to unrelated agents |
+| Per-message try/except in WS handler | Fault isolation: malformed payload returns error JSON, doesn't sever the connection |
+| No FK on claims | Workers claim by `message_id` received over WS — FK to `messages` would fail if worker connects to a different DB shard or the message hasn't replicated yet |
+| SelectorEventLoop on Windows | psycopg3 async requires selector-based I/O, ProactorEventLoop is incompatible |
