@@ -1,4 +1,4 @@
-"""Quick demo: 3 workers + orchestrator, short tasks, full flow visible."""
+"""Quick demo: register agents, 3 workers + orchestrator, short tasks, full flow."""
 
 import asyncio
 import sys
@@ -14,18 +14,48 @@ from agents.worker_agent import WorkerAgent, _engine
 from agents.llm import chat
 
 
+async def register_or_get_key(agent_id: str, capabilities: list[str]) -> str:
+    """Register agent, return key. If already registered, re-register via admin."""
+    import httpx
+    url = "http://localhost:8000"
+    admin_key = "dev-secret-change-me"
+    async with httpx.AsyncClient() as client:
+        # delete if exists (clean slate)
+        await client.delete(f"{url}/agents/{agent_id}",
+                            headers={"Authorization": f"Bearer {admin_key}"})
+        resp = await client.post(f"{url}/agents/register",
+                                 json={"agent_id": agent_id, "capabilities": capabilities},
+                                 headers={"Authorization": f"Bearer {admin_key}"})
+        resp.raise_for_status()
+        key = resp.json()["api_key"]
+        logging.info("registered %s → key=%s...", agent_id, key[:12])
+        return key
+
+
 async def main():
-    # start workers
+    # register all agents and get per-agent keys
+    keys = {}
+    agent_defs = [
+        ("worker-0", ["general"]),
+        ("worker-1", ["general"]),
+        ("worker-2", ["general"]),
+        ("orchestrator", ["orchestration"]),
+    ]
+    for aid, caps in agent_defs:
+        keys[aid] = await register_or_get_key(aid, caps)
+
+    # start workers with per-agent keys
     workers = [
-        WorkerAgent("0", model="qwen3:0.6b", capabilities=["general"]),
-        WorkerAgent("1", model="qwen3:0.6b", capabilities=["general"]),
-        WorkerAgent("2", model="qwen3:1.7b", capabilities=["general"]),
+        WorkerAgent("0", model="qwen3:0.6b", capabilities=["general"], token=keys["worker-0"]),
+        WorkerAgent("1", model="qwen3:0.6b", capabilities=["general"], token=keys["worker-1"]),
+        WorkerAgent("2", model="qwen3:1.7b", capabilities=["general"], token=keys["worker-2"]),
     ]
 
     orchestrator = BaseAgent(
         agent_id="orchestrator",
         capabilities=["orchestration"],
         groups=["workers"],
+        token=keys["orchestrator"],
     )
 
     results = []

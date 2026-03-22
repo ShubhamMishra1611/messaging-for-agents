@@ -6,11 +6,13 @@ import uuid
 from typing import Callable, Awaitable
 from urllib.parse import urlencode
 
+import httpx
 import websockets
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SERVER_URL = os.getenv("AGENT_SERVER_URL", "ws://localhost:8000")
+DEFAULT_HTTP_URL = os.getenv("AGENT_HTTP_URL", "http://localhost:8000")
 DEFAULT_TOKEN = os.getenv("API_SECRET", "dev-secret-change-me")
 
 
@@ -33,6 +35,21 @@ class BaseAgent:
         self._ws = None
         self._handlers: dict[str, Callable[[dict], Awaitable[None]]] = {}
         self._running = False
+
+    @staticmethod
+    async def register(agent_id: str, capabilities: list[str] | None = None,
+                       http_url: str | None = None, admin_key: str | None = None) -> str:
+        """Register agent with server, returns per-agent API key."""
+        url = (http_url or DEFAULT_HTTP_URL) + "/agents/register"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json={
+                "agent_id": agent_id,
+                "capabilities": capabilities or [],
+            }, headers={"Authorization": f"Bearer {admin_key or DEFAULT_TOKEN}"})
+            if resp.status_code == 409:
+                raise ValueError(f"agent '{agent_id}' already registered")
+            resp.raise_for_status()
+            return resp.json()["api_key"]
 
     async def connect(self):
         params = {

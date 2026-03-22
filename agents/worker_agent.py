@@ -20,12 +20,14 @@ _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 
 class WorkerAgent(BaseAgent):
-    def __init__(self, worker_id: str, model: str = "qwen3:0.6b", server_url: str | None = None, capabilities: list[str] | None = None):
+    def __init__(self, worker_id: str, model: str = "qwen3:0.6b", server_url: str | None = None,
+                 capabilities: list[str] | None = None, token: str | None = None):
         super().__init__(
             agent_id=f"worker-{worker_id}",
             server_url=server_url,
             capabilities=capabilities or ["general"],
             groups=["workers"],
+            token=token,
         )
         self.model = model
 

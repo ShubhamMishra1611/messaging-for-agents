@@ -29,9 +29,10 @@ class Agent(Base):
     __tablename__ = "agents"
 
     agent_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     capabilities: Mapped[list] = mapped_column(ARRAY(String), nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
-    server_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    server_id: Mapped[str] = mapped_column(String(128), nullable=False, default="unassigned")
     connected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )

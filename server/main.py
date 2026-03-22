@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import selectors
 import sys
 import uuid
@@ -87,6 +89,67 @@ async def list_agents(_=Depends(verify_token)):
 async def find_by_capability(capability: str, _=Depends(verify_token)):
     agents = await registry.find_by_capability(capability)
     return {"agents": agents}
+
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+@app.post("/agents/register")
+async def register_agent(body: dict, _=Depends(verify_token)):
+    agent_id = body.get("agent_id", "").strip()
+    if not agent_id or not validate_agent_id(agent_id):
+        raise HTTPException(400, "invalid agent_id")
+    capabilities = body.get("capabilities", [])
+
+    api_key = secrets.token_urlsafe(32)
+
+    async with async_session() as session:
+        existing = await session.get(Agent, agent_id)
+        if existing and existing.api_key_hash:
+            raise HTTPException(409, f"agent '{agent_id}' already registered")
+        if existing:
+            existing.api_key_hash = _hash_key(api_key)
+            existing.capabilities = capabilities
+        else:
+            session.add(Agent(
+                agent_id=agent_id,
+                api_key_hash=_hash_key(api_key),
+                capabilities=capabilities,
+                status="offline",
+            ))
+        await session.commit()
+
+    logger.info("registered agent %s", agent_id)
+    return {"agent_id": agent_id, "api_key": api_key}
+
+
+@app.post("/agents/{agent_id}/rotate-key")
+async def rotate_key(agent_id: str, body: dict, _=Depends(verify_token)):
+    old_key = body.get("old_key", "")
+    async with async_session() as session:
+        agent = await session.get(Agent, agent_id)
+        if not agent or not agent.api_key_hash:
+            raise HTTPException(404, "agent not found")
+        if agent.api_key_hash != _hash_key(old_key):
+            raise HTTPException(403, "invalid old key")
+        new_key = secrets.token_urlsafe(32)
+        agent.api_key_hash = _hash_key(new_key)
+        await session.commit()
+    return {"agent_id": agent_id, "api_key": new_key}
+
+
+@app.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str, _=Depends(verify_token)):
+    async with async_session() as session:
+        agent = await session.get(Agent, agent_id)
+        if not agent:
+            raise HTTPException(404, "agent not found")
+        await session.delete(agent)
+        await session.commit()
+    manager.disconnect(agent_id)
+    logger.info("deleted agent %s", agent_id)
+    return {"deleted": agent_id}
 
 
 DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
@@ -176,15 +239,20 @@ async def dashboard_messages(limit: int = Query(default=50, le=200)):
 
 @app.websocket("/ws/{agent_id}")
 async def websocket_endpoint(ws: WebSocket, agent_id: str):
-    # auth: check token in query param (WS can't use headers easily)
-    token = ws.query_params.get("token", "")
-    if token != API_SECRET:
-        await ws.close(code=4403, reason="unauthorized")
-        return
-
     if not validate_agent_id(agent_id):
         await ws.close(code=4400, reason="invalid agent_id")
         return
+
+    # auth: per-agent key or admin key
+    token = ws.query_params.get("token", "")
+    if token == API_SECRET:
+        pass  # admin key always works
+    else:
+        async with async_session() as session:
+            agent = await session.get(Agent, agent_id)
+            if not agent or not agent.api_key_hash or agent.api_key_hash != _hash_key(token):
+                await ws.close(code=4403, reason="unauthorized")
+                return
 
     connected = await manager.connect(agent_id, ws)
     if not connected:
