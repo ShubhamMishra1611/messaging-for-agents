@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Message Bus</title>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+<style>
+  :root {
+    --bg-primary: #1a1a2e;
+    --bg-secondary: #16213e;
+    --bg-card: #1c2541;
+    --bg-sidebar: #0f0f23;
+    --text-primary: #e0e0e0;
+    --text-secondary: #8a8f98;
+    --text-muted: #5a5f6b;
+    --accent: #c9a84c;
+    --accent-dim: #8a7535;
+    --border: #2a2d3a;
+    --green: #4ade80;
+    --orange: #fb923c;
+    --red: #f87171;
+    --gray: #6b7280;
+    --font-serif: Georgia, 'Times New Roman', serif;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    height: 100vh;
+  }
+
+  /* --- Sidebar --- */
+  .sidebar {
+    background: var(--bg-sidebar);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 20px 18px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-header h1 {
+    font-family: var(--font-serif);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.02em;
+  }
+
+  .sidebar-header .subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .agent-section {
+    padding: 14px 18px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+
+  .agent-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 10px;
+  }
+
+  .agent-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    cursor: default;
+    transition: background 0.15s;
+  }
+
+  .agent-item:hover { background: rgba(255,255,255,0.03); }
+
+  .agent-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .agent-dot.idle { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .agent-dot.busy { background: var(--orange); box-shadow: 0 0 6px var(--orange); }
+  .agent-dot.offline { background: var(--gray); }
+
+  .agent-info { flex: 1; min-width: 0; }
+
+  .agent-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .agent-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .agent-status-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .agent-status-badge.idle { color: var(--green); background: rgba(74,222,128,0.1); }
+  .agent-status-badge.busy { color: var(--orange); background: rgba(251,146,60,0.1); }
+  .agent-status-badge.offline { color: var(--gray); background: rgba(107,114,128,0.1); }
+
+  .sidebar-stats {
+    border-top: 1px solid var(--border);
+    padding: 14px 18px;
+  }
+
+  .sidebar-stat {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    font-size: 12px;
+  }
+
+  .sidebar-stat .label { color: var(--text-muted); }
+  .sidebar-stat .value { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* --- Main --- */
+  .main {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    overflow: hidden;
+  }
+
+  /* Stats bar */
+  .stats-bar {
+    display: flex;
+    gap: 1px;
+    background: var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .stat-card {
+    flex: 1;
+    background: var(--bg-secondary);
+    padding: 14px 18px;
+    text-align: center;
+  }
+
+  .stat-value {
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+  }
+
+  .stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  /* Graph */
+  .graph-container {
+    position: relative;
+    background: var(--bg-primary);
+  }
+
+  #network {
+    width: 100%;
+    height: 100%;
+  }
+
+  .graph-legend {
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    background: rgba(15,15,35,0.85);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 14px;
+    font-size: 11px;
+    display: flex;
+    gap: 14px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+  }
+
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  /* Message feed */
+  .feed {
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    overflow-y: auto;
+    max-height: 200px;
+  }
+
+  .feed-header {
+    padding: 10px 18px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    position: sticky;
+    top: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .feed-item {
+    display: grid;
+    grid-template-columns: 70px 90px 30px 90px 1fr 60px;
+    gap: 10px;
+    align-items: center;
+    padding: 6px 18px;
+    border-bottom: 1px solid rgba(42,45,58,0.5);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .feed-item:hover { background: rgba(255,255,255,0.015); }
+
+  .feed-time { color: var(--text-muted); font-size: 11px; }
+  .feed-from { color: var(--accent); font-weight: 500; }
+  .feed-arrow { color: var(--text-muted); text-align: center; }
+  .feed-to { color: var(--text-secondary); font-weight: 500; }
+  .feed-content {
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .feed-type {
+    font-size: 10px;
+    text-align: right;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-weight: 500;
+  }
+  .feed-type.dm { color: #60a5fa; background: rgba(96,165,250,0.1); }
+  .feed-type.group { color: #a78bfa; background: rgba(167,139,250,0.1); }
+
+  .empty-state {
+    padding: 40px;
+    text-align: center;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1>Agent Message Bus</h1>
+      <div class="subtitle" id="server-id">connecting...</div>
+    </div>
+    <div class="agent-section">Agents</div>
+    <div class="agent-list" id="agent-list">
+      <div class="empty-state">No agents connected</div>
+    </div>
+    <div class="sidebar-stats" id="sidebar-stats"></div>
+  </aside>
+
+  <main class="main">
+    <div class="stats-bar">
+      <div class="stat-card"><div class="stat-value" id="s-agents">0</div><div class="stat-label">Connected</div></div>
+      <div class="stat-card"><div class="stat-value" id="s-messages">0</div><div class="stat-label">Messages</div></div>
+      <div class="stat-card"><div class="stat-value" id="s-delivered">0</div><div class="stat-label">Delivered</div></div>
+      <div class="stat-card"><div class="stat-value" id="s-pending">0</div><div class="stat-label">Pending</div></div>
+      <div class="stat-card"><div class="stat-value" id="s-claims">0</div><div class="stat-label">Claims</div></div>
+    </div>
+
+    <div class="graph-container">
+      <div id="network"></div>
+      <div class="graph-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Idle</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div>Busy</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--gray)"></div>Offline</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--accent);border-radius:2px;width:10px;height:10px"></div>Group</div>
+      </div>
+    </div>
+
+    <div class="feed">
+      <div class="feed-header">Recent Messages</div>
+      <div id="feed-list">
+        <div class="empty-state">No messages yet</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const API = '';
+const STATUS_COLORS = { idle: '#4ade80', busy: '#fb923c', offline: '#6b7280' };
+const GROUP_COLOR = '#c9a84c';
+
+let network, nodes, edges;
+
+// --- vis.js setup ---
+function initGraph() {
+  nodes = new vis.DataSet();
+  edges = new vis.DataSet();
+  const container = document.getElementById('network');
+  network = new vis.Network(container, { nodes, edges }, {
+    physics: {
+      solver: 'forceAtlas2Based',
+      forceAtlas2Based: { gravitationalConstant: -60, centralGravity: 0.008, springLength: 140, springConstant: 0.04 },
+      stabilization: { iterations: 80 }
+    },
+    nodes: {
+      font: { color: '#e0e0e0', size: 13, face: 'Georgia' },
+      borderWidth: 2,
+      shadow: { enabled: true, color: 'rgba(0,0,0,0.3)', size: 8 }
+    },
+    edges: {
+      color: { color: '#2a2d3a', highlight: '#c9a84c', hover: '#c9a84c' },
+      font: { color: '#5a5f6b', size: 10, strokeWidth: 0, face: '-apple-system, sans-serif' },
+      arrows: { to: { enabled: true, scaleFactor: 0.6 } },
+      smooth: { type: 'curvedCW', roundness: 0.15 },
+      width: 1.5
+    },
+    interaction: { hover: true, tooltipDelay: 200 }
+  });
+}
+
+function updateGraph(agents, flows) {
+  const currentNodes = new Set(nodes.getIds());
+  const currentEdges = new Set(edges.getIds());
+  const seenNodes = new Set();
+  const seenEdges = new Set();
+
+  // agent nodes
+  for (const a of agents) {
+    seenNodes.add(a.agent_id);
+    const data = {
+      id: a.agent_id,
+      label: a.agent_id,
+      color: { background: STATUS_COLORS[a.status] || '#6b7280', border: 'rgba(255,255,255,0.15)' },
+      shape: 'dot',
+      size: 18,
+      title: `${a.agent_id}\nStatus: ${a.status}\nCapabilities: ${(a.capabilities||[]).join(', ') || 'none'}`
+    };
+    if (currentNodes.has(a.agent_id)) nodes.update(data);
+    else nodes.add(data);
+  }
+
+  // group nodes from flows
+  for (const f of flows) {
+    if (f.type === 'group') {
+      const gid = `group:${f.to}`;
+      seenNodes.add(gid);
+      if (!currentNodes.has(gid) && !nodes.get(gid)) {
+        nodes.add({ id: gid, label: f.to, color: { background: GROUP_COLOR, border: 'rgba(255,255,255,0.15)' }, shape: 'diamond', size: 14 });
+      }
+    }
+  }
+
+  // edges
+  for (const f of flows) {
+    const to = f.type === 'group' ? `group:${f.to}` : f.to;
+    const eid = `${f.from_agent}->${to}`;
+    seenEdges.add(eid);
+    const data = {
+      id: eid,
+      from: f.from_agent,
+      to: to,
+      label: String(f.count),
+      width: Math.min(1 + Math.log2(f.count + 1), 5),
+      color: { color: f.type === 'group' ? 'rgba(201,168,76,0.4)' : 'rgba(96,165,250,0.3)' }
+    };
+    if (currentEdges.has(eid)) edges.update(data);
+    else edges.add(data);
+  }
+
+  // remove stale
+  for (const id of currentNodes) { if (!seenNodes.has(id)) nodes.remove(id); }
+  for (const id of currentEdges) { if (!seenEdges.has(id)) edges.remove(id); }
+}
+
+// --- sidebar ---
+function renderAgents(agents) {
+  const el = document.getElementById('agent-list');
+  if (!agents.length) { el.innerHTML = '<div class="empty-state">No agents connected</div>'; return; }
+
+  const sorted = [...agents].sort((a, b) => {
+    const order = { busy: 0, idle: 1, offline: 2 };
+    return (order[a.status] ?? 3) - (order[b.status] ?? 3);
+  });
+
+  el.innerHTML = sorted.map(a => `
+    <div class="agent-item">
+      <div class="agent-dot ${a.status}"></div>
+      <div class="agent-info">
+        <div class="agent-name">${a.agent_id}</div>
+        <div class="agent-meta">${(a.capabilities||[]).join(', ') || 'no capabilities'}</div>
+      </div>
+      <div class="agent-status-badge ${a.status}">${a.status}</div>
+    </div>
+  `).join('');
+
+  const counts = { idle: 0, busy: 0, offline: 0 };
+  agents.forEach(a => counts[a.status] = (counts[a.status] || 0) + 1);
+  document.getElementById('sidebar-stats').innerHTML = `
+    <div class="sidebar-stat"><span class="label">Idle</span><span class="value">${counts.idle}</span></div>
+    <div class="sidebar-stat"><span class="label">Busy</span><span class="value">${counts.busy}</span></div>
+    <div class="sidebar-stat"><span class="label">Offline</span><span class="value">${counts.offline}</span></div>
+  `;
+}
+
+// --- stats ---
+function renderStats(s) {
+  document.getElementById('s-agents').textContent = s.active_agents;
+  document.getElementById('s-messages').textContent = s.total_messages;
+  document.getElementById('s-delivered').textContent = s.delivered;
+  document.getElementById('s-pending').textContent = s.pending;
+  document.getElementById('s-claims').textContent = s.total_claims;
+}
+
+// --- feed ---
+function renderMessages(messages) {
+  const el = document.getElementById('feed-list');
+  if (!messages.length) { el.innerHTML = '<div class="empty-state">No messages yet</div>'; return; }
+
+  el.innerHTML = messages.map(m => {
+    const t = new Date(m.timestamp);
+    const time = t.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const content = typeof m.content === 'object' ? JSON.stringify(m.content) : m.content;
+    return `<div class="feed-item">
+      <span class="feed-time">${time}</span>
+      <span class="feed-from">${m.from_agent}</span>
+      <span class="feed-arrow">→</span>
+      <span class="feed-to">${m.to}</span>
+      <span class="feed-content" title="${content.replace(/"/g, '&quot;')}">${content}</span>
+      <span class="feed-type ${m.type}">${m.type}</span>
+    </div>`;
+  }).join('');
+}
+
+// --- polling ---
+async function fetchData() {
+  try {
+    const [agentsR, statsR, flowR, msgsR] = await Promise.all([
+      fetch(`${API}/api/dashboard/agents`),
+      fetch(`${API}/api/dashboard/stats`),
+      fetch(`${API}/api/dashboard/message-flow`),
+      fetch(`${API}/api/dashboard/messages?limit=50`),
+    ]);
+
+    const agents = await agentsR.json();
+    const stats = await statsR.json();
+    const flows = await flowR.json();
+    const msgs = await msgsR.json();
+
+    renderAgents(agents);
+    renderStats(stats);
+    renderMessages(msgs);
+    updateGraph(agents, flows);
+
+    document.getElementById('server-id').textContent = `polling · ${new Date().toLocaleTimeString('en-US', { hour12: false })}`;
+  } catch (e) {
+    document.getElementById('server-id').textContent = 'connection error';
+    console.error(e);
+  }
+}
+
+// --- init ---
+initGraph();
+fetchData();
+setInterval(fetchData, 2000);
+</script>
+</body>
+</html>

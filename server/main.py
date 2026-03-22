@@ -14,12 +14,16 @@ if sys.platform == "win32":
     )
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import select, func, text
 from starlette.requests import Request
 
 from db.database import engine, async_session
-from db.models import Base, GroupMembership, VALID_AGENT_STATUSES
+from db.models import Base, GroupMembership, Message, Agent, Ack, Claim, DeliveryAttempt, VALID_AGENT_STATUSES
 from registry.agent_registry import AgentRegistry
 from server.connection_manager import ConnectionManager, validate_agent_id, MAX_MESSAGE_SIZE
 from server.message_router import MessageRouter
@@ -83,6 +87,91 @@ async def list_agents(_=Depends(verify_token)):
 async def find_by_capability(capability: str, _=Depends(verify_token)):
     agents = await registry.find_by_capability(capability)
     return {"agents": agents}
+
+
+DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_HTML.read_text(encoding="utf-8")
+
+
+@app.get("/api/dashboard/agents")
+async def dashboard_agents():
+    async with async_session() as session:
+        result = await session.execute(select(Agent))
+        agents = result.scalars().all()
+        return [
+            {
+                "agent_id": a.agent_id,
+                "status": a.status,
+                "capabilities": a.capabilities or [],
+                "server_id": a.server_id,
+                "connected_at": a.connected_at.isoformat() if a.connected_at else None,
+            }
+            for a in agents
+        ]
+
+
+@app.get("/api/dashboard/stats")
+async def dashboard_stats():
+    async with async_session() as session:
+        total_msgs = (await session.execute(select(func.count(Message.id)))).scalar() or 0
+        delivered = (await session.execute(
+            select(func.count(Message.id)).where(Message.status == "delivered")
+        )).scalar() or 0
+        pending = (await session.execute(
+            select(func.count(Message.id)).where(Message.status == "pending")
+        )).scalar() or 0
+        total_claims = (await session.execute(select(func.count(Claim.id)))).scalar() or 0
+        active = (await session.execute(
+            select(func.count(Agent.agent_id)).where(Agent.status != "offline")
+        )).scalar() or 0
+        return {
+            "connected": len(manager.connected_agents),
+            "total_messages": total_msgs,
+            "delivered": delivered,
+            "pending": pending,
+            "total_claims": total_claims,
+            "active_agents": active,
+        }
+
+
+@app.get("/api/dashboard/message-flow")
+async def dashboard_message_flow():
+    async with async_session() as session:
+        result = await session.execute(
+            select(
+                Message.from_agent, Message.to, Message.type,
+                func.count(Message.id).label("count")
+            ).group_by(Message.from_agent, Message.to, Message.type)
+        )
+        return [
+            {"from_agent": row.from_agent, "to": row.to, "type": row.type, "count": row.count}
+            for row in result.all()
+        ]
+
+
+@app.get("/api/dashboard/messages")
+async def dashboard_messages(limit: int = Query(default=50, le=200)):
+    async with async_session() as session:
+        result = await session.execute(
+            select(Message).order_by(Message.timestamp.desc()).limit(limit)
+        )
+        msgs = result.scalars().all()
+        return [
+            {
+                "id": str(m.id),
+                "from_agent": m.from_agent,
+                "to": m.to,
+                "type": m.type,
+                "content": m.content,
+                "status": m.status,
+                "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            }
+            for m in msgs
+        ]
 
 
 @app.websocket("/ws/{agent_id}")
