@@ -116,16 +116,23 @@ class MessageRouter:
         required_capabilities: list[str]
     ) -> list[str]:
         """Group members that satisfy required_capabilities."""
-        stmt = (
-            select(GroupMembership.agent_id)
-            .join(Agent, Agent.agent_id == GroupMembership.agent_id)
-            .where(GroupMembership.group_id == group_id)
-        )
-        if exclude:
-            stmt = stmt.where(GroupMembership.agent_id != exclude)
         if required_capabilities:
+            # join Agent only when capability filtering is needed
+            stmt = (
+                select(GroupMembership.agent_id)
+                .join(Agent, Agent.agent_id == GroupMembership.agent_id)
+                .where(GroupMembership.group_id == group_id)
+            )
+            if exclude:
+                stmt = stmt.where(GroupMembership.agent_id != exclude)
             for cap in required_capabilities:
                 stmt = stmt.where(Agent.capabilities.any(cap))
+        else:
+            stmt = select(GroupMembership.agent_id).where(
+                GroupMembership.group_id == group_id
+            )
+            if exclude:
+                stmt = stmt.where(GroupMembership.agent_id != exclude)
         rows = (await session.execute(stmt)).scalars().all()
         return list(rows)
 

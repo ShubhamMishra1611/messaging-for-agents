@@ -5,7 +5,7 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Agent, GroupMembership, VALID_AGENT_STATUSES
+from db.models import Agent, GroupMembership, Claim, VALID_AGENT_STATUSES
 from server.redis_pubsub import RedisPubSub
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,10 @@ class AgentRegistry:
                 )
             )
             await session.execute(stmt)
+            # clear stale in-flight claims so backpressure doesn't block on reconnect
+            await session.execute(
+                delete(Claim).where(Claim.agent_id == agent_id, Claim.status == "claimed")
+            )
             await session.commit()
 
         await self._cache_agent(agent_id, capabilities, "idle", server_id)
