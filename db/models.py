@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import String, DateTime, ForeignKey, UniqueConstraint, Integer
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -23,6 +23,16 @@ class Message(Base):
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
+    # feature: thread/correlation IDs
+    thread_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    parent_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    # feature: request/reply
+    reply_to: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # feature: capability routing
+    required_capabilities: Mapped[list | None] = mapped_column(ARRAY(String), nullable=True)
 
 
 class Agent(Base):
@@ -36,6 +46,8 @@ class Agent(Base):
     connected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
+    # feature: backpressure
+    max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 VALID_AGENT_STATUSES = {"idle", "busy", "offline"}
@@ -103,3 +115,7 @@ class Claim(Base):
     claimed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
+    # feature: task lifecycle
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="claimed")  # claimed | completed | failed | timed_out
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

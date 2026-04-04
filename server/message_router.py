@@ -6,11 +6,13 @@ from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Message, Ack, DeliveryAttempt, GroupMembership
+from db.models import Message, Ack, DeliveryAttempt, GroupMembership, Agent, Claim
 from server.connection_manager import ConnectionManager
 from server.redis_pubsub import RedisPubSub
 
 logger = logging.getLogger(__name__)
+
+CLAIM_TIMEOUT_SECONDS = 120  # reclaim after 2 min of no completion
 
 
 class MessageRouter:
@@ -31,20 +33,28 @@ class MessageRouter:
         if isinstance(timestamp, str):
             timestamp = datetime.fromisoformat(timestamp)
 
-        # for group msgs, count recipients
+        thread_id_raw = payload.get("thread_id")
+        thread_id = uuid.UUID(thread_id_raw) if thread_id_raw else None
+        parent_message_id_raw = payload.get("parent_message_id")
+        parent_message_id = uuid.UUID(parent_message_id_raw) if parent_message_id_raw else None
+        reply_to = payload.get("reply_to")
+        correlation_id = payload.get("correlation_id")
+        required_capabilities = payload.get("required_capabilities") or []
+
         recipient_count = 1
         if msg_type == "group":
             async with self._session_factory() as session:
-                count = await session.execute(
-                    select(func.count()).select_from(GroupMembership).where(
-                        GroupMembership.group_id == to,
-                        GroupMembership.agent_id != from_agent,
-                    )
+                members = await self._get_capable_members(
+                    session, to, exclude=from_agent, required_capabilities=required_capabilities
                 )
-                recipient_count = count.scalar() or 0
+                recipient_count = len(members)
 
         async with self._session_factory() as session:
-            await self._persist_message(session, msg_id, from_agent, to, msg_type, content, timestamp, recipient_count)
+            await self._persist_message(
+                session, msg_id, from_agent, to, msg_type, content, timestamp,
+                recipient_count, thread_id, parent_message_id, reply_to, correlation_id,
+                required_capabilities or None,
+            )
 
         envelope = {
             "id": str(msg_id),
@@ -53,6 +63,11 @@ class MessageRouter:
             "type": msg_type,
             "content": content,
             "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
+            "thread_id": str(thread_id) if thread_id else None,
+            "parent_message_id": str(parent_message_id) if parent_message_id else None,
+            "reply_to": reply_to,
+            "correlation_id": correlation_id,
+            "required_capabilities": required_capabilities or None,
         }
 
         if msg_type == "dm":
@@ -61,7 +76,6 @@ class MessageRouter:
             await self._route_group(envelope)
 
     async def _route_dm(self, envelope: dict):
-        # always publish to Redis for consistency/auditability
         await self._redis.publish(f"dm:{envelope['to']}", envelope)
 
     async def _route_group(self, envelope: dict):
@@ -70,6 +84,14 @@ class MessageRouter:
     async def deliver_from_pubsub(self, envelope: dict):
         """Called by redis subscriber — deliver to local agent if connected."""
         msg_type = envelope.get("type", "dm")
+
+        # reply_to routing: if this is a reply, deliver to the reply_to agent directly
+        if envelope.get("reply_to") and msg_type == "dm":
+            to = envelope["to"]
+            if self._manager.is_local(to):
+                await self._deliver_local(to, envelope)
+            return
+
         if msg_type == "dm":
             to = envelope["to"]
             if self._manager.is_local(to):
@@ -77,24 +99,72 @@ class MessageRouter:
         elif msg_type == "group":
             group_id = envelope["to"]
             sender = envelope["from_agent"]
-            members = await self._get_local_group_members(group_id, exclude=sender)
-            for agent_id in members:
-                await self._deliver_local(agent_id, envelope)
+            required_capabilities = envelope.get("required_capabilities") or []
+            async with self._session_factory() as session:
+                members = await self._get_capable_members(
+                    session, group_id, exclude=sender,
+                    required_capabilities=required_capabilities,
+                )
+            # backpressure: filter out saturated agents
+            available = await self._filter_available(members)
+            for agent_id in available:
+                if self._manager.is_local(agent_id):
+                    await self._deliver_local(agent_id, envelope)
 
-    async def _get_local_group_members(self, group_id: str, exclude: str | None = None) -> list[str]:
-        """Return locally connected agents that are members of this group."""
+    async def _get_capable_members(
+        self, session: AsyncSession, group_id: str, exclude: str | None,
+        required_capabilities: list[str]
+    ) -> list[str]:
+        """Group members that satisfy required_capabilities."""
+        stmt = (
+            select(GroupMembership.agent_id)
+            .join(Agent, Agent.agent_id == GroupMembership.agent_id)
+            .where(GroupMembership.group_id == group_id)
+        )
+        if exclude:
+            stmt = stmt.where(GroupMembership.agent_id != exclude)
+        if required_capabilities:
+            for cap in required_capabilities:
+                stmt = stmt.where(Agent.capabilities.any(cap))
+        rows = (await session.execute(stmt)).scalars().all()
+        return list(rows)
+
+    async def _filter_available(self, agent_ids: list[str]) -> list[str]:
+        """Return agents that have capacity (in-flight claims < max_concurrent)."""
+        if not agent_ids:
+            return []
         async with self._session_factory() as session:
-            stmt = select(GroupMembership.agent_id).where(GroupMembership.group_id == group_id)
-            if exclude:
-                stmt = stmt.where(GroupMembership.agent_id != exclude)
-            rows = (await session.execute(stmt)).scalars().all()
-        return [aid for aid in rows if self._manager.is_local(aid)]
+            # get max_concurrent for each agent
+            agents = (await session.execute(
+                select(Agent.agent_id, Agent.max_concurrent)
+                .where(Agent.agent_id.in_(agent_ids))
+            )).all()
+            limits = {row.agent_id: row.max_concurrent for row in agents}
+
+            # count active (claimed) claims per agent
+            in_flight = (await session.execute(
+                select(Claim.agent_id, func.count(Claim.id).label("cnt"))
+                .where(
+                    Claim.agent_id.in_(agent_ids),
+                    Claim.status == "claimed",
+                )
+                .group_by(Claim.agent_id)
+            )).all()
+            in_flight_map = {row.agent_id: row.cnt for row in in_flight}
+
+        available = []
+        for aid in agent_ids:
+            limit = limits.get(aid, 1)
+            current = in_flight_map.get(aid, 0)
+            if current < limit:
+                available.append(aid)
+            else:
+                logger.debug("agent %s saturated (%d/%d), skipping", aid, current, limit)
+        return available
 
     async def _deliver_local(self, agent_id: str, envelope: dict) -> bool:
         msg_id = uuid.UUID(envelope["id"])
 
-        # exactly-once: INSERT delivery_attempt BEFORE sending
-        # if INSERT conflicts, another server already delivered — skip
         async with self._session_factory() as session:
             stmt = (
                 pg_insert(DeliveryAttempt)
@@ -104,13 +174,13 @@ class MessageRouter:
             result = await session.execute(stmt)
             await session.commit()
             if result.rowcount == 0:
-                logger.debug("msg %s already being delivered to %s, skipping", msg_id, agent_id)
+                logger.debug("msg %s already delivered to %s, skipping", msg_id, agent_id)
                 return True
 
         return await self._manager.send_json(agent_id, envelope)
 
     async def handle_ack(self, agent_id: str, message_id: str):
-        """Process ACK — insert ack, mark delivered only when all recipients acked."""
+        """Process ACK — insert ack, mark delivered when all recipients acked."""
         msg_id = uuid.UUID(message_id)
         async with self._session_factory() as session:
             stmt = (
@@ -131,7 +201,24 @@ class MessageRouter:
             await session.commit()
         logger.debug("ack recorded: msg=%s agent=%s", msg_id, agent_id)
 
-    async def _persist_message(self, session: AsyncSession, msg_id, from_agent, to, msg_type, content, timestamp, recipient_count):
+    async def complete_claim(self, agent_id: str, message_id: str, failed: bool = False):
+        """Mark a claim as completed or failed (called by worker after finishing task)."""
+        msg_id = uuid.UUID(message_id)
+        new_status = "failed" if failed else "completed"
+        async with self._session_factory() as session:
+            claim = (await session.execute(
+                select(Claim).where(Claim.message_id == msg_id, Claim.agent_id == agent_id)
+            )).scalar_one_or_none()
+            if claim:
+                claim.status = new_status
+                await session.commit()
+        logger.debug("claim %s marked %s by %s", message_id[:8], new_status, agent_id)
+
+    async def _persist_message(
+        self, session: AsyncSession, msg_id, from_agent, to, msg_type,
+        content, timestamp, recipient_count, thread_id, parent_message_id,
+        reply_to, correlation_id, required_capabilities,
+    ):
         stmt = (
             pg_insert(Message)
             .values(
@@ -143,6 +230,11 @@ class MessageRouter:
                 status="pending",
                 timestamp=timestamp,
                 recipient_count=recipient_count,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                reply_to=reply_to,
+                correlation_id=correlation_id,
+                required_capabilities=required_capabilities,
             )
             .on_conflict_do_nothing()
         )

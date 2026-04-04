@@ -28,6 +28,7 @@ from db.database import engine, async_session
 from db.models import Base, GroupMembership, Message, Agent, Ack, Claim, DeliveryAttempt, VALID_AGENT_STATUSES
 from registry.agent_registry import AgentRegistry
 from server.connection_manager import ConnectionManager, validate_agent_id, MAX_MESSAGE_SIZE
+from server.claim_sweeper import ClaimSweeper
 from server.message_router import MessageRouter
 from server.redis_pubsub import RedisPubSub
 
@@ -41,6 +42,7 @@ manager = ConnectionManager()
 redis_ps = RedisPubSub()
 registry: AgentRegistry | None = None
 router: MessageRouter | None = None
+sweeper: ClaimSweeper | None = None
 
 security = HTTPBearer()
 
@@ -53,7 +55,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global registry, router
+    global registry, router, sweeper
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -61,12 +63,15 @@ async def lifespan(app: FastAPI):
     await redis_ps.connect()
     registry = AgentRegistry(redis_ps, async_session)
     router = MessageRouter(manager, redis_ps, async_session)
+    sweeper = ClaimSweeper(async_session, redis_ps)
+    sweeper.start()
 
     await redis_ps.psubscribe("dm:*", "group:*", handler=router.deliver_from_pubsub)
 
     logger.info("server %s started", SERVER_ID)
     yield
 
+    sweeper.stop()
     await redis_ps.disconnect()
     await engine.dispose()
     logger.info("server %s stopped", SERVER_ID)
@@ -318,6 +323,14 @@ async def websocket_endpoint(ws: WebSocket, agent_id: str):
                     group_id = data.get("group_id")
                     if group_id:
                         await registry.leave_group(agent_id, group_id)
+
+                elif action == "complete_claim":
+                    message_id = data.get("message_id")
+                    failed = data.get("failed", False)
+                    if not message_id:
+                        await ws.send_json({"error": "missing message_id"})
+                        continue
+                    await router.complete_claim(agent_id, message_id, failed=failed)
 
                 else:
                     await ws.send_json({"error": "unknown action", "action": action})
